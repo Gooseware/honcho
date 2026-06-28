@@ -109,18 +109,18 @@ Messages are stored but no observations, summaries, or representations are being
    ```bash
    DERIVER_WORKERS=4
    ```
-5. **Representation Batch Max** — By default the deriver is set to buffer its operations until there are enough tokens for a given representation in a session. This is set via the `REPRESENTATION_BATCH_MAX_TOKENS` environment variable. If you aren't seeing tasks continue it may be that the batch size is set too high or enough data hasn't flowed into to the session yet. See [token batching](/v3/documentation/core-concepts/reasoning#token-batching) for more details
+5. **Representation Batch Max** — By default the deriver buffers representation work until a session has enough tokens for that representation, set via `DERIVER_REPRESENTATION_BATCH_MAX_TOKENS`. Sub-threshold tails become eligible after `DERIVER_REPRESENTATION_BATCH_MAX_AGE_SECONDS` (default 1800 seconds), so quiet sessions eventually flush without disabling batching globally. Set the age to `0` for legacy behavior where sub-threshold tails wait indefinitely. See [token batching](/v3/documentation/core-concepts/reasoning#token-batching) for more details
 
 ## Alternative Provider Issues
 
 ### OpenRouter / custom provider not working
 
-If you set `PROVIDER=custom` but calls fail:
+If calls to an OpenAI-compatible proxy fail:
 
-1. **Verify the endpoint and key are set:**
+1. **Verify the endpoint and key are set.** Use `transport = "openai"` with a base URL override:
    ```bash
-   LLM_OPENAI_COMPATIBLE_BASE_URL=https://openrouter.ai/api/v1
-   LLM_OPENAI_COMPATIBLE_API_KEY=sk-or-v1-...
+   LLM_OPENAI_API_KEY=sk-or-v1-...
+   DERIVER_MODEL_CONFIG__OVERRIDES__BASE_URL=https://openrouter.ai/api/v1
    ```
 
 2. **Check model names match the provider's format.** OpenRouter uses `vendor/model` format (e.g., `anthropic/claude-haiku-4-5`), not the raw model ID.
@@ -139,29 +139,42 @@ If you set `PROVIDER=custom` but calls fail:
 
 2. **In Docker**, `localhost` inside a container doesn't reach the host. Use `host.docker.internal` (macOS/Windows) or the host's network IP:
    ```bash
-   LLM_VLLM_BASE_URL=http://host.docker.internal:8000/v1
+   DERIVER_MODEL_CONFIG__OVERRIDES__BASE_URL=http://host.docker.internal:8000/v1
    ```
 
-3. **Structured output failures** — vLLM's structured output support is limited to certain response formats. If you see JSON parsing errors, check the deriver/dream logs for the raw response.
+3. **Structured output failures** — vLLM's structured output support is limited to certain response formats. If you see JSON parsing errors, check the deriver/dream logs for the raw response. See [Deriver produces no observations](#deriver-produces-no-observations) below.
+
+### Deriver produces no observations
+
+If messages are processed (the queue drains, no errors in logs) but peers never accumulate observations — and you're using an OpenAI-compatible provider — the likely cause is that the provider doesn't support OpenAI Structured Outputs (`json_schema`). The OpenAI backend requests `json_schema` by default; providers like **Z.AI GLM** and some **Ollama/vLLM** deployments either reject it or silently ignore it and return prose, which the deriver can't parse into observations.
+
+**Fix:** set `STRUCTURED_OUTPUT_MODE=json_object` on the deriver's model config to request loose JSON mode, which injects the schema into the prompt instead:
+
+```bash
+DERIVER_MODEL_CONFIG__STRUCTURED_OUTPUT_MODE=json_object
+```
+
+This is a per-model-config setting on the OpenAI transport; set it on whichever features use the affected provider (e.g. `DREAM_DEDUCTION_MODEL_CONFIG__STRUCTURED_OUTPUT_MODE`).
 
 ### Thinking budget errors with non-Anthropic providers
 
-If you see errors like `thinking budget not supported`, `invalid parameter`, or silent failures where agents produce no output, your `THINKING_BUDGET_TOKENS` is likely set to a value > 0 with a provider that doesn't support Anthropic-style extended thinking.
+If you see errors like `thinking budget not supported`, `invalid parameter`, or silent failures where agents produce no output, one of your per-component `*_MODEL_CONFIG__THINKING_BUDGET_TOKENS` overrides is likely set to a value > 0 with a provider that doesn't support Anthropic-style extended thinking. The built-in defaults do not set thinking budgets, so this only applies if you added those overrides yourself.
 
-**Fix:** Set `THINKING_BUDGET_TOKENS=0` for every component when using non-Anthropic providers:
+**Fix:** Set `*_MODEL_CONFIG__THINKING_BUDGET_TOKENS=0` for every component when using models that don't support thinking:
 
 ```bash
-DERIVER_THINKING_BUDGET_TOKENS=0
-SUMMARY_THINKING_BUDGET_TOKENS=0
-DREAM_THINKING_BUDGET_TOKENS=0
-DIALECTIC_LEVELS__minimal__THINKING_BUDGET_TOKENS=0
-DIALECTIC_LEVELS__low__THINKING_BUDGET_TOKENS=0
-DIALECTIC_LEVELS__medium__THINKING_BUDGET_TOKENS=0
-DIALECTIC_LEVELS__high__THINKING_BUDGET_TOKENS=0
-DIALECTIC_LEVELS__max__THINKING_BUDGET_TOKENS=0
+DERIVER_MODEL_CONFIG__THINKING_BUDGET_TOKENS=0
+SUMMARY_MODEL_CONFIG__THINKING_BUDGET_TOKENS=0
+DREAM_DEDUCTION_MODEL_CONFIG__THINKING_BUDGET_TOKENS=0
+DREAM_INDUCTION_MODEL_CONFIG__THINKING_BUDGET_TOKENS=0
+DIALECTIC_LEVELS__minimal__MODEL_CONFIG__THINKING_BUDGET_TOKENS=0
+DIALECTIC_LEVELS__low__MODEL_CONFIG__THINKING_BUDGET_TOKENS=0
+DIALECTIC_LEVELS__medium__MODEL_CONFIG__THINKING_BUDGET_TOKENS=0
+DIALECTIC_LEVELS__high__MODEL_CONFIG__THINKING_BUDGET_TOKENS=0
+DIALECTIC_LEVELS__max__MODEL_CONFIG__THINKING_BUDGET_TOKENS=0
 ```
 
-This applies to OpenRouter (with non-Anthropic models), vLLM, Ollama, Groq, Google, and OpenAI providers. Only Anthropic models support the thinking budget parameter.
+For OpenAI reasoning models, use `*_MODEL_CONFIG__THINKING_EFFORT` instead of `*_MODEL_CONFIG__THINKING_BUDGET_TOKENS`.
 
 ## Database Issues
 

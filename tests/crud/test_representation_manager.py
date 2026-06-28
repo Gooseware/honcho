@@ -1,3 +1,7 @@
+from contextlib import asynccontextmanager
+from datetime import datetime, timedelta, timezone
+from unittest.mock import AsyncMock, patch
+
 import pytest
 from nanoid import generate as generate_nanoid
 from sqlalchemy import func, update
@@ -5,6 +9,47 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from src import models
 from src.crud.representation import RepresentationManager
+from src.schemas.configuration import (
+    ResolvedConfiguration,
+    ResolvedDreamConfiguration,
+    ResolvedPeerCardConfiguration,
+    ResolvedReasoningConfiguration,
+    ResolvedSummaryConfiguration,
+)
+from src.utils.representation import (
+    DeductiveObservation,
+    ExplicitObservation,
+    Representation,
+)
+
+
+def _resolved_config(*, dream_enabled: bool = False) -> ResolvedConfiguration:
+    """Build a minimal ResolvedConfiguration for tests that only care about dream.enabled."""
+    return ResolvedConfiguration(
+        reasoning=ResolvedReasoningConfiguration(enabled=False),
+        peer_card=ResolvedPeerCardConfiguration(use=False, create=False),
+        summary=ResolvedSummaryConfiguration(
+            enabled=False,
+            messages_per_short_summary=20,
+            messages_per_long_summary=60,
+        ),
+        dream=ResolvedDreamConfiguration(enabled=dream_enabled),
+    )
+
+
+@asynccontextmanager
+async def _fake_tracked_db(_name: str):
+    yield object()
+
+
+def _saved_observations(mock_save: AsyncMock):
+    call = mock_save.await_args
+    assert call is not None, "mock_save was never awaited"
+    if "all_observations" in call.kwargs:
+        return call.kwargs["all_observations"]
+    if len(call.args) > 1:
+        return call.args[1]
+    raise AssertionError("missing all_observations in await args")
 
 
 class TestRepresentationManagerSoftDelete:
@@ -134,3 +179,211 @@ class TestRepresentationManagerSoftDelete:
         result_ids = [doc.id for doc in results]
         assert doc_live.id in result_ids
         assert doc_deleted.id not in result_ids
+
+    @pytest.mark.asyncio
+    async def test_query_documents_most_derived_ties_break_by_recency(
+        self,
+        db_session: AsyncSession,
+        sample_data: tuple[models.Workspace, models.Peer],
+    ):
+        """Regression: when times_derived ties, the manager's most-derived query
+        must fall back to recency, not insertion order. Mirrors the equivalent
+        test on crud.query_documents_most_derived -- the query is duplicated in
+        both modules and must not drift."""
+        test_workspace, test_peer = sample_data
+        test_peer2, test_session, _, manager = await self._setup(
+            db_session, test_workspace, test_peer
+        )
+
+        base = datetime(2026, 1, 1, tzinfo=timezone.utc)
+        # Three conclusions, all reinforced once, inserted oldest-first.
+        for i in range(3):
+            db_session.add(
+                models.Document(
+                    workspace_name=test_workspace.name,
+                    observer=test_peer.name,
+                    observed=test_peer2.name,
+                    content=f"tie {i}",
+                    session_name=test_session.name,
+                    times_derived=1,
+                    created_at=base + timedelta(days=i),
+                )
+            )
+        # A genuinely reinforced conclusion that is also the oldest of all.
+        db_session.add(
+            models.Document(
+                workspace_name=test_workspace.name,
+                observer=test_peer.name,
+                observed=test_peer2.name,
+                content="hot",
+                session_name=test_session.name,
+                times_derived=5,
+                created_at=base - timedelta(days=10),
+            )
+        )
+        await db_session.flush()
+
+        results = await manager._query_documents_most_derived(db_session, top_k=10)  # pyright: ignore[reportPrivateUsage]
+
+        contents = [doc.content for doc in results]
+        # Primary sort still wins: the actually-reinforced conclusion leads.
+        assert contents[0] == "hot"
+        # Ties break toward most-recent, not oldest-inserted.
+        assert contents[1:] == ["tie 2", "tie 1", "tie 0"]
+
+
+class TestRepresentationManagerSave:
+    @pytest.mark.asyncio
+    async def test_save_representation_filters_blank_observations_before_embedding(
+        self,
+    ):
+        manager = RepresentationManager(
+            "workspace",
+            observer="observer",
+            observed="observed",
+        )
+        representation = Representation(
+            explicit=[
+                ExplicitObservation(
+                    content="   ",
+                    created_at=datetime.now(timezone.utc),
+                    message_ids=[1],
+                    session_name="session",
+                ),
+                ExplicitObservation(
+                    content=" useful observation ",
+                    created_at=datetime.now(timezone.utc),
+                    message_ids=[1],
+                    session_name="session",
+                ),
+            ]
+        )
+
+        with (
+            patch("src.crud.representation.tracked_db", _fake_tracked_db),
+            patch(
+                "src.crud.representation.embedding_client.simple_batch_embed",
+                new=AsyncMock(return_value=[[0.1]]),
+            ) as mock_embed,
+            patch.object(
+                manager,
+                "_save_representation_internal",
+                new=AsyncMock(return_value=1),
+            ) as mock_save,
+        ):
+            saved = await manager.save_representation(
+                representation,
+                message_ids=[1],
+                session_name="session",
+                message_created_at=datetime.now(timezone.utc),
+                message_level_configuration=_resolved_config(),
+            )
+
+        assert saved == 1
+        mock_embed.assert_awaited_once_with(["useful observation"])
+        saved_observations = _saved_observations(mock_save)
+        assert len(saved_observations) == 1
+        assert saved_observations[0].content == "useful observation"
+
+    @pytest.mark.asyncio
+    async def test_save_representation_filters_blank_deductive_observations(self):
+        manager = RepresentationManager(
+            "workspace",
+            observer="observer",
+            observed="observed",
+        )
+        representation = Representation(
+            deductive=[
+                DeductiveObservation(
+                    conclusion="   ",
+                    premises=["premise a"],
+                    source_ids=["doc-a"],
+                    created_at=datetime.now(timezone.utc),
+                    message_ids=[1],
+                    session_name="session",
+                ),
+                DeductiveObservation(
+                    conclusion=" inferred conclusion ",
+                    premises=["premise b"],
+                    source_ids=["doc-b"],
+                    created_at=datetime.now(timezone.utc),
+                    message_ids=[1],
+                    session_name="session",
+                ),
+            ]
+        )
+
+        with (
+            patch("src.crud.representation.tracked_db", _fake_tracked_db),
+            patch(
+                "src.crud.representation.embedding_client.simple_batch_embed",
+                new=AsyncMock(return_value=[[0.2]]),
+            ) as mock_embed,
+            patch.object(
+                manager,
+                "_save_representation_internal",
+                new=AsyncMock(return_value=1),
+            ) as mock_save,
+        ):
+            saved = await manager.save_representation(
+                representation,
+                message_ids=[1],
+                session_name="session",
+                message_created_at=datetime.now(timezone.utc),
+                message_level_configuration=_resolved_config(),
+            )
+
+        assert saved == 1
+        mock_embed.assert_awaited_once_with(["inferred conclusion"])
+        saved_observations = _saved_observations(mock_save)
+        assert len(saved_observations) == 1
+        assert isinstance(saved_observations[0], DeductiveObservation)
+        assert saved_observations[0].conclusion == "inferred conclusion"
+
+    @pytest.mark.asyncio
+    async def test_save_representation_skips_all_blank_observations(self):
+        manager = RepresentationManager(
+            "workspace",
+            observer="observer",
+            observed="observed",
+        )
+        representation = Representation(
+            explicit=[
+                ExplicitObservation(
+                    content="",
+                    created_at=datetime.now(timezone.utc),
+                    message_ids=[1],
+                    session_name="session",
+                ),
+                ExplicitObservation(
+                    content="\n\t ",
+                    created_at=datetime.now(timezone.utc),
+                    message_ids=[1],
+                    session_name="session",
+                ),
+            ]
+        )
+
+        with (
+            patch("src.crud.representation.tracked_db", _fake_tracked_db),
+            patch(
+                "src.crud.representation.embedding_client.simple_batch_embed",
+                new=AsyncMock(),
+            ) as mock_embed,
+            patch.object(
+                manager,
+                "_save_representation_internal",
+                new=AsyncMock(),
+            ) as mock_save,
+        ):
+            saved = await manager.save_representation(
+                representation,
+                message_ids=[1],
+                session_name="session",
+                message_created_at=datetime.now(timezone.utc),
+                message_level_configuration=_resolved_config(),
+            )
+
+        assert saved == 0
+        mock_embed.assert_not_awaited()
+        mock_save.assert_not_awaited()

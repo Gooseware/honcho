@@ -97,7 +97,7 @@ class WorkspaceBase(BaseModel):
 class WorkspaceCreate(WorkspaceBase):
     name: Annotated[
         str,
-        Field(alias="id", min_length=1, max_length=100, pattern=RESOURCE_NAME_PATTERN),
+        Field(alias="id", min_length=1, max_length=512, pattern=RESOURCE_NAME_PATTERN),
     ]
     metadata: _SanitizedMetadata = {}
     configuration: WorkspaceConfiguration = Field(
@@ -141,7 +141,7 @@ class PeerBase(BaseModel):
 class PeerCreate(PeerBase):
     name: Annotated[
         str,
-        Field(alias="id", min_length=1, max_length=100, pattern=RESOURCE_NAME_PATTERN),
+        Field(alias="id", min_length=1, max_length=512, pattern=RESOURCE_NAME_PATTERN),
     ]
     metadata: _SanitizedMetadata | None = None
     configuration: dict[str, Any] | None = None
@@ -322,7 +322,7 @@ class SessionBase(BaseModel):
 class SessionCreate(SessionBase):
     name: Annotated[
         str,
-        Field(alias="id", min_length=1, max_length=100, pattern=RESOURCE_NAME_PATTERN),
+        Field(alias="id", min_length=1, max_length=512, pattern=RESOURCE_NAME_PATTERN),
     ]
     metadata: _SanitizedMetadata | None = None
     peer_names: dict[str, SessionPeerConfig] | None = Field(default=None, alias="peers")
@@ -501,9 +501,10 @@ class ConclusionCreate(BaseModel):
         tokens = encoding.encode(self.content)
         self._token_count = len(tokens)
 
-        if self._token_count > settings.MAX_EMBEDDING_TOKENS:
+        if self._token_count > settings.EMBEDDING.MAX_INPUT_TOKENS:
             raise ValueError(
-                f"Content exceeds maximum embedding token limit of {settings.MAX_EMBEDDING_TOKENS} "
+                "Content exceeds maximum embedding token limit of "
+                + f"{settings.EMBEDDING.MAX_INPUT_TOKENS} "
                 + f"(got {self._token_count} tokens)"
             )
         return self
@@ -680,10 +681,17 @@ class WebhookEndpointCreate(WebhookEndpointBase):
         if parsed.hostname:
             try:
                 ip_address = ipaddress.ip_address(parsed.hostname)
-                if ip_address.is_private:
-                    raise ValueError("Private IP addresses are not allowed")
-            except ValueError:  # Not an IP address, might be a hostname
-                pass
+            except ValueError:  # Not an IP literal — a hostname, leave it alone
+                ip_address = None
+            if ip_address is not None and (
+                ip_address.is_private
+                or ip_address.is_loopback
+                or ip_address.is_link_local
+                or ip_address.is_reserved
+                or ip_address.is_multicast
+                or ip_address.is_unspecified
+            ):
+                raise ValueError("Private/internal IP addresses are not allowed")
 
         return v
 
